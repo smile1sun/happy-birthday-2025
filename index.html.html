@@ -1,0 +1,453 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>Holographic Birthday Wish</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #000;
+            font-family: 'Courier New', Courier, monospace;
+        }
+        #canvas-container {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+            z-index: 1;
+        }
+        /* 隐藏视频元素，我们只需要数据 */
+        #input-video {
+            display: none;
+            position: absolute;
+            top: 0;
+            left: 0;
+        }
+        #ui-layer {
+            position: absolute;
+            z-index: 10;
+            color: #00ffff;
+            text-align: center;
+            width: 100%;
+            bottom: 30px;
+            pointer-events: none;
+            text-shadow: 0 0 10px #00ffff;
+        }
+        #loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: #00ffff;
+            z-index: 20;
+            font-size: 20px;
+            background: rgba(0, 20, 40, 0.8);
+            padding: 20px;
+            border: 1px solid #00ffff;
+            border-radius: 10px;
+            pointer-events: auto;
+            cursor: pointer;
+            box-shadow: 0 0 20px rgba(0, 255, 255, 0.3);
+        }
+        .instruction {
+            font-size: 14px;
+            opacity: 0.8;
+            margin-top: 5px;
+        }
+    </style>
+    <script src="https://unpkg.com/three@0.128.0/build/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+</head>
+<body>
+
+    <div id="loading" onclick="startExperience()">
+        <div>点击开始全息投影</div>
+        <div style="font-size:12px; margin-top:10px; color:#aaa;">请允许摄像头权限</div>
+    </div>
+
+    <div id="ui-layer">
+        <div id="status-text">等待摄像头信号...</div>
+        <div class="instruction">🖐 张开手掌: 生日快乐 | ✊ 握拳: 蛋糕</div>
+    </div>
+
+    <video id="input-video" playsinline></video>
+    <div id="canvas-container"></div>
+
+<script>
+    // --- 配置 ---
+    const PARTICLE_COUNT = 4000; // 粒子数量，手机卡顿可调小
+    const TEXT_CONTENT = "HAPPY\nBIRTHDAY\n[聪娃儿]"; // 修改这里的名字
+    const CAMERA_WIDTH = 1280;
+    const CAMERA_HEIGHT = 720;
+    
+    // --- 状态变量 ---
+    let isRunning = false;
+    let handDetected = false;
+    let handPosition = new THREE.Vector3(0, 0, 0); // 归一化的手部位置
+    let gestureState = 'IDLE'; // IDLE, TEXT, CAKE
+    
+    // --- Three.js 变量 ---
+    let scene, camera, renderer;
+    let particles, particleGeo, particleMaterial;
+    let positions, targetPositions;
+    let clock = new THREE.Clock();
+
+    // --- 目标点云数据 ---
+    let textPoints = [];
+    let cakePoints = [];
+    let idlePoints = [];
+
+    // ==========================================
+    // 1. 初始化 Three.js 场景
+    // ==========================================
+    function initScene() {
+        const container = document.getElementById('canvas-container');
+        
+        scene = new THREE.Scene();
+        scene.fog = new THREE.FogExp2(0x000000, 0.002);
+
+        camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.z = 50;
+
+        renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        container.appendChild(renderer.domElement);
+
+        // 创建粒子系统
+        createParticles();
+        
+        window.addEventListener('resize', onWindowResize, false);
+    }
+
+    // ==========================================
+    // 2. 粒子系统与点云生成
+    // ==========================================
+    
+    // 创建圆形辉光纹理
+    function createGlowTexture() {
+        const canvas = document.createElement('canvas');
+        canvas.width = 32;
+        canvas.height = 32;
+        const ctx = canvas.getContext('2d');
+        const gradient = ctx.createRadialGradient(16, 16, 0, 16, 16, 16);
+        gradient.addColorStop(0, 'rgba(0, 255, 255, 1)'); // 核心亮青色
+        gradient.addColorStop(0.4, 'rgba(0, 100, 255, 0.5)'); // 中间蓝紫色
+        gradient.addColorStop(1, 'rgba(0, 0, 0, 0)');
+        ctx.fillStyle = gradient;
+        ctx.fillRect(0, 0, 32, 32);
+        const texture = new THREE.Texture(canvas);
+        texture.needsUpdate = true;
+        return texture;
+    }
+
+    function createParticles() {
+        particleGeo = new THREE.BufferGeometry();
+        positions = new Float32Array(PARTICLE_COUNT * 3);
+        targetPositions = new Float32Array(PARTICLE_COUNT * 3);
+
+        // 初始化所有粒子在随机位置
+        for (let i = 0; i < PARTICLE_COUNT; i++) {
+            positions[i * 3] = (Math.random() - 0.5) * 200;
+            positions[i * 3 + 1] = (Math.random() - 0.5) * 200;
+            positions[i * 3 + 2] = (Math.random() - 0.5) * 100;
+            
+            // 默认闲置目标也是随机的
+            idlePoints.push({
+                x: (Math.random() - 0.5) * 100,
+                y: (Math.random() - 0.5) * 100,
+                z: (Math.random() - 0.5) * 50
+            });
+        }
+
+        particleGeo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+
+        particleMaterial = new THREE.PointsMaterial({
+            color: 0xffffff,
+            size: 1.5,
+            map: createGlowTexture(),
+            transparent: true,
+            opacity: 0.9,
+            blending: THREE.AdditiveBlending, // 关键：发光叠加模式
+            depthWrite: false
+        });
+
+        particles = new THREE.Points(particleGeo, particleMaterial);
+        scene.add(particles);
+
+        // 生成形状数据
+        generateTextPoints();
+        generateCakePoints();
+    }
+
+    // 生成文字点云
+    function generateTextPoints() {
+        const canvas = document.createElement('canvas');
+        const ctx = canvas.getContext('2d');
+        const width = 1024; // 画布大一点以获得清晰度
+        const height = 512;
+        canvas.width = width;
+        canvas.height = height;
+
+        ctx.fillStyle = '#000000';
+        ctx.fillRect(0, 0, width, height);
+        
+        ctx.fillStyle = '#ffffff';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.font = 'bold 120px Arial'; // 字体大小
+        
+        const lines = TEXT_CONTENT.split('\n');
+        const lineHeight = 140;
+        lines.forEach((line, i) => {
+            const yOffset = (i - (lines.length - 1) / 2) * lineHeight;
+            ctx.fillText(line, width / 2, height / 2 + yOffset);
+        });
+
+        const imageData = ctx.getImageData(0, 0, width, height);
+        const data = imageData.data;
+
+        // 扫描像素
+        const validPixels = [];
+        for (let y = 0; y < height; y += 4) { // 步长控制采样密度
+            for (let x = 0; x < width; x += 4) {
+                const index = (y * width + x) * 4;
+                if (data[index] > 128) { // 如果是白色像素
+                    validPixels.push({
+                        x: (x - width / 2) * 0.15, // 缩放因子
+                        y: -(y - height / 2) * 0.15, // 反转Y轴
+                        z: 0
+                    });
+                }
+            }
+        }
+        
+        // 填充到 textPoints 数组，如果点不够就循环使用，如果多了就截断
+        for (let i = 0; i < PARTICLE_COUNT; i++) {
+            const p = validPixels[i % validPixels.length];
+            // 加一点随机Z轴厚度
+            textPoints.push({ x: p.x, y: p.y, z: (Math.random() - 0.5) * 5 }); 
+        }
+    }
+
+    // 生成蛋糕形状点云
+    function generateCakePoints() {
+        // 蛋糕底部
+        for (let i = 0; i < PARTICLE_COUNT; i++) {
+            let x, y, z;
+            const ratio = i / PARTICLE_COUNT;
+            
+            if (ratio < 0.6) {
+                // 蛋糕体 (两层圆柱)
+                const layer = ratio < 0.3 ? 10 : 7; // 半径
+                const heightBase = ratio < 0.3 ? -10 : -3;
+                const angle = Math.random() * Math.PI * 2;
+                const r = Math.sqrt(Math.random()) * layer; // 均匀分布在圆内
+                
+                x = Math.cos(angle) * r;
+                z = Math.sin(angle) * r; // 这里的z其实是深度，但在3D里我们暂用z做深度
+                y = heightBase + Math.random() * 5; 
+            } else if (ratio < 0.8) {
+                // 蜡烛
+                x = 0;
+                z = 0;
+                y = 3 + Math.random() * 8;
+            } else {
+                // 火焰 (顶部发散)
+                const angle = Math.random() * Math.PI * 2;
+                const r = Math.random() * 2;
+                x = Math.cos(angle) * r;
+                z = Math.sin(angle) * r;
+                y = 11 + Math.random() * 4;
+            }
+            
+            cakePoints.push({ x: x * 1.5, y: y * 1.5, z: z * 1.5 });
+        }
+    }
+
+    // ==========================================
+    // 3. MediaPipe 手势识别
+    // ==========================================
+    function initMediaPipe() {
+        const videoElement = document.getElementById('input-video');
+        
+        const hands = new Hands({locateFile: (file) => {
+            return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+        }});
+
+        hands.setOptions({
+            maxNumHands: 1,
+            modelComplexity: 1,
+            minDetectionConfidence: 0.5,
+            minTrackingConfidence: 0.5
+        });
+
+        hands.onResults(onResults);
+
+        const cameraUtils = new Camera(videoElement, {
+            onFrame: async () => {
+                await hands.send({image: videoElement});
+            },
+            width: CAMERA_WIDTH,
+            height: CAMERA_HEIGHT
+        });
+        
+        return cameraUtils;
+    }
+
+    function onResults(results) {
+        const uiText = document.getElementById('status-text');
+
+        if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+            handDetected = true;
+            const landmarks = results.multiHandLandmarks[0];
+
+            // 1. 获取手掌中心位置 (归一化 0-1)
+            // 索引9是中指根部，0是手腕，取中间
+            const palmX = (landmarks[0].x + landmarks[9].x) / 2;
+            const palmY = (landmarks[0].y + landmarks[9].y) / 2;
+            
+            // 映射到 Three.js 坐标系 (反转X轴因为自拍镜像是反的)
+            // 视口大约宽60, 高30 (根据摄像机Z=50估算)
+            handPosition.x = (0.5 - palmX) * 60; 
+            handPosition.y = (0.5 - palmY) * 40;
+
+            // 2. 简易手势识别
+            // 计算拇指指尖(4)和食指指尖(8)的距离
+            const thumbTip = landmarks[4];
+            const indexTip = landmarks[8];
+            const distance = Math.sqrt(
+                Math.pow(thumbTip.x - indexTip.x, 2) + 
+                Math.pow(thumbTip.y - indexTip.y, 2)
+            );
+
+            // 距离阈值需要调试，通常 0.05-0.1 算捏合/握拳
+            if (distance < 0.05) {
+                gestureState = 'CAKE';
+                uiText.innerText = "生成：生日蛋糕 🎂";
+                // 改变颜色模拟火焰
+                particleMaterial.color.setHex(0xffaa00);
+            } else {
+                gestureState = 'TEXT';
+                uiText.innerText = "生成：祝福文字 ✨";
+                // 恢复全息蓝
+                particleMaterial.color.setHex(0x00ffff);
+            }
+
+        } else {
+            handDetected = false;
+            gestureState = 'IDLE';
+            uiText.innerText = "未检测到手部，显示待机粒子";
+            particleMaterial.color.setHex(0x0055ff);
+        }
+    }
+
+    // ==========================================
+    // 4. 动画循环与逻辑
+    // ==========================================
+    
+    function animate() {
+        requestAnimationFrame(animate);
+        
+        const time = clock.getElapsedTime();
+        const positionsArray = particleGeo.attributes.position.array;
+
+        // 确定当前应该去哪个目标集合
+        let currentTargetSet = idlePoints;
+        if (handDetected) {
+            if (gestureState === 'TEXT') currentTargetSet = textPoints;
+            else if (gestureState === 'CAKE') currentTargetSet = cakePoints;
+        }
+
+        for (let i = 0; i < PARTICLE_COUNT; i++) {
+            const px = i * 3;
+            const py = i * 3 + 1;
+            const pz = i * 3 + 2;
+
+            // 获取基础目标位置
+            let tx = currentTargetSet[i % currentTargetSet.length].x;
+            let ty = currentTargetSet[i % currentTargetSet.length].y;
+            let tz = currentTargetSet[i % currentTargetSet.length].z;
+
+            // 如果检测到手，给整体加一个偏移量，让物体跟随手移动
+            if (handDetected) {
+                tx += handPosition.x;
+                ty += handPosition.y;
+                // z轴稍微靠近摄像机一点
+                tz += 5; 
+            } else {
+                // 待机模式：缓慢旋转
+                const angle = time * 0.1 + i * 0.001;
+                const r = 30 + Math.sin(time * 0.5 + i) * 10;
+                tx = Math.cos(angle) * r;
+                ty = Math.sin(angle) * r * 0.5; // 压扁一点
+                tz = Math.sin(time * 0.2) * 20;
+            }
+
+            // 增加噪点/漂浮感 (Hologram drift)
+            tx += Math.sin(time * 2 + i) * 0.5;
+            ty += Math.cos(time * 1.5 + i) * 0.5;
+
+            // 物理平滑移动 (Lerp)
+            // 握拳变蛋糕时速度快一点，平时慢一点
+            const speed = gestureState === 'CAKE' ? 0.08 : 0.05;
+            
+            positionsArray[px] += (tx - positionsArray[px]) * speed;
+            positionsArray[py] += (ty - positionsArray[py]) * speed;
+            positionsArray[pz] += (tz - positionsArray[pz]) * speed;
+        }
+
+        particleGeo.attributes.position.needsUpdate = true;
+        
+        // 只有手张开时才允许相机轻微晃动，增加立体感
+        if (gestureState === 'TEXT') {
+            camera.position.x += (handPosition.x * 0.2 - camera.position.x) * 0.05;
+            camera.position.y += (handPosition.y * 0.2 - camera.position.y) * 0.05;
+        } else {
+            // 复位
+            camera.position.x += (0 - camera.position.x) * 0.05;
+            camera.position.y += (0 - camera.position.y) * 0.05;
+        }
+        camera.lookAt(0, 0, 0);
+
+        renderer.render(scene, camera);
+    }
+
+    function onWindowResize() {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+    }
+
+    // ==========================================
+    // 启动流程
+    // ==========================================
+    function startExperience() {
+        if (isRunning) return;
+        
+        document.getElementById('loading').innerText = "初始化系统...";
+        
+        initScene();
+        
+        const cameraUtils = initMediaPipe();
+        cameraUtils.start()
+            .then(() => {
+                document.getElementById('loading').style.display = 'none';
+                isRunning = true;
+                animate();
+            })
+            .catch(err => {
+                console.error(err);
+                document.getElementById('loading').innerText = "摄像头启动失败，请检查权限或HTTPS连接。";
+            });
+    }
+
+</script>
+</body>
+</html>
